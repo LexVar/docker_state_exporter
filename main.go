@@ -143,7 +143,10 @@ func (c *dockerHealthCollector) collectContainer() {
 
 	for _, container := range containers {
 		info, err := c.containerClient.ContainerInspect(context.Background(), container.ID)
-		errCheck(err)
+    if err != nil {
+      errorLogger.Log("message", err)
+      continue
+		}
 		c.containerInfoCache = append(c.containerInfoCache, info)
 
 		if info.Config == nil {
