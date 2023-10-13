@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -16,15 +15,18 @@ import (
 	"github.com/docker/docker/api/types"
 	tcontainer "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+  "github.com/alecthomas/kingpin/v2"
+ 	"github.com/prometheus/exporter-toolkit/web"
+	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
 )
 
 var (
-	addContainerLabels bool
-	cachePeriod        time.Duration
+	addContainerLabels *bool
+	cachePeriod        *time.Duration
 )
 
 type dockerHealthCollector struct {
@@ -78,7 +80,7 @@ func (c *dockerHealthCollector) Collect(ch chan<- prometheus.Metric) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	if now.Sub(c.lastseen) >= cachePeriod {
+	if now.Sub(c.lastseen) >= *cachePeriod {
 		c.collectContainer()
 		c.lastseen = now
 	}
@@ -91,7 +93,7 @@ func (c *dockerHealthCollector) collectMetrics(ch chan<- prometheus.Metric) {
 
 		rep := regexp.MustCompile("[^a-zA-Z0-9_]")
 
-		if addContainerLabels {
+		if *addContainerLabels {
 			for k, v := range info.Config.Labels {
 				label := strings.ToLower("container_label_" + k)
 				labels[rep.ReplaceAllLiteralString(label, "_")] = v
@@ -182,7 +184,7 @@ func errCheck(err error) {
 
 // Define flags.
 var (
-	address = flag.String("listen-address", ":8080", "The address to listen on for HTTP requests.")
+  toolkitFlags = kingpinflag.AddFlags(kingpin.CommandLine, ":9491")
 )
 
 func init() {
@@ -191,12 +193,14 @@ func init() {
 	errorLogger = log.With(errorLogger, "timestamp", log.DefaultTimestampUTC)
 	errorLogger = log.With(errorLogger, "severity", "error")
 	prometheus.MustRegister(collectors.NewBuildInfoCollector())
-	cachePeriod = time.Duration(*flag.Int("cache-period", 1, "The period of time the collector will reuse the results of docker inspect before polling again, in seconds")) * time.Second
-	flag.BoolVar(&addContainerLabels, "add-container-labels", true, "Add labels from docker containers as metric labels")
 }
 
 func main() {
-	flag.Parse()
+	kingpin.CommandLine.UsageWriter(os.Stdout)
+	kingpin.HelpFlag.Short('h')
+  cachePeriod = kingpin.Flag("cache-period", "The period of time the collector will reuse the results of docker inspect before polling again").Default("5s").Duration()
+  addContainerLabels = kingpin.Flag("add-container-labels", "Add labels from docker containers as metric labels").Default("false").Bool()
+	kingpin.Parse()
 
 	client, err := client.NewClientWithOpts()
 	errCheck(err)
@@ -204,6 +208,7 @@ func main() {
 
 	_, err = client.Ping(context.Background())
 	errCheck(err)
+  normalLogger.Log("message", fmt.Sprintf("Cache period is set to %v", *cachePeriod))
 
 	prometheus.MustRegister(&dockerHealthCollector{
 		containerClient: client,
@@ -221,13 +226,11 @@ func main() {
 		prometheus.DefaultGatherer,
 		promhttp.HandlerOpts{ErrorLog: &loggerWrapper{Logger: &errorLogger}, EnableOpenMetrics: true}))
 
-	normalLogger.Log("message", "Server listening...", "address", address)
-
-	server := &http.Server{Addr: *address, Handler: nil}
+	server := &http.Server{}
 
 	go func() {
-		err = server.ListenAndServe()
-		if err != http.ErrServerClosed {
+		err = web.ListenAndServe(server, toolkitFlags, normalLogger)
+		if err != nil {
 			errCheck(err)
 		}
 	}()
@@ -240,7 +243,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
-		errorLogger.Log("message", fmt.Sprintf("Failed to gracefully shutdown: %v", err))
+		errorLogger.Log("message", fmt.Sprintf("Failed to gracefully shutdown: %d", err))
 	}
 	normalLogger.Log("message", "Server shutdown")
 }
