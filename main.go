@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/docker/docker/api/types"
 	tcontainer "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
@@ -19,8 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-  "github.com/alecthomas/kingpin/v2"
- 	"github.com/prometheus/exporter-toolkit/web"
+	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
 )
 
@@ -65,6 +65,12 @@ var (
 	restartcountDesc = descSource{
 		"container_restartcount",
 		"Number of times the container has been restarted"}
+	lastseenDesc = descSource{
+		namespace + "lastseen",
+		"Time when the Container was last seen."}
+
+	// Key is the container name; value is the last time the container was seen
+	lastseenContainers map[string]time.Time = map[string]time.Time{}
 )
 
 func (c *dockerHealthCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -74,6 +80,7 @@ func (c *dockerHealthCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- startedatDesc.Desc(nil)
 	ch <- finishedatDesc.Desc(nil)
 	ch <- restartcountDesc.Desc(nil)
+	ch <- lastseenDesc.Desc(nil)
 }
 
 func (c *dockerHealthCollector) Collect(ch chan<- prometheus.Metric) {
@@ -81,7 +88,7 @@ func (c *dockerHealthCollector) Collect(ch chan<- prometheus.Metric) {
 	defer c.mu.Unlock()
 	now := time.Now()
 	if now.Sub(c.lastseen) >= *cachePeriod {
-		c.collectContainer()
+		c.collectContainers()
 		c.lastseen = now
 	}
 	c.collectMetrics(ch)
@@ -136,19 +143,30 @@ func (c *dockerHealthCollector) collectMetrics(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(finishedatDesc.Desc(labels), prometheus.GaugeValue, float64(finishedat.Unix()))
 		ch <- prometheus.MustNewConstMetric(restartcountDesc.Desc(labels), prometheus.GaugeValue, float64(info.RestartCount))
 	}
+	// Loop over the last seen containers map and create metrics for each container
+	for name, lastseen := range lastseenContainers {
+		var labels = map[string]string{"name": name}
+		ch <- prometheus.MustNewConstMetric(lastseenDesc.Desc(labels), prometheus.GaugeValue, float64(lastseen.Unix()))
+	}
 }
 
-func (c *dockerHealthCollector) collectContainer() {
+func (c *dockerHealthCollector) collectContainers() {
+	// Get list of containers that currently exist in the docker daemon
 	containers, err := c.containerClient.ContainerList(context.Background(), types.ContainerListOptions{All: true})
 	errCheck(err)
 	c.containerInfoCache = []types.ContainerJSON{}
 
 	for _, container := range containers {
+		// Collect metrics for each container
 		info, err := c.containerClient.ContainerInspect(context.Background(), container.ID)
-    if err != nil {
-      errorLogger.Log("message", err)
-      continue
+		if err != nil {
+			errorLogger.Log("message", err)
+			continue
 		}
+		// Append container name to known list of container names
+		containerName := strings.TrimPrefix(info.Name, "/")
+		lastseenContainers[containerName] = time.Now()
+
 		c.containerInfoCache = append(c.containerInfoCache, info)
 
 		if info.Config == nil {
@@ -184,7 +202,7 @@ func errCheck(err error) {
 
 // Define flags.
 var (
-  toolkitFlags = kingpinflag.AddFlags(kingpin.CommandLine, ":9491")
+	toolkitFlags = kingpinflag.AddFlags(kingpin.CommandLine, ":9491")
 )
 
 func init() {
@@ -198,8 +216,8 @@ func init() {
 func main() {
 	kingpin.CommandLine.UsageWriter(os.Stdout)
 	kingpin.HelpFlag.Short('h')
-  cachePeriod = kingpin.Flag("cache-period", "The period of time the collector will reuse the results of docker inspect before polling again").Default("5s").Duration()
-  addContainerLabels = kingpin.Flag("add-container-labels", "Add labels from docker containers as metric labels").Default("false").Bool()
+	cachePeriod = kingpin.Flag("cache-period", "The period of time the collector will reuse the results of docker inspect before polling again").Default("5s").Duration()
+	addContainerLabels = kingpin.Flag("add-container-labels", "Add labels from docker containers as metric labels").Default("false").Bool()
 	kingpin.Parse()
 
 	client, err := client.NewClientWithOpts()
@@ -208,7 +226,7 @@ func main() {
 
 	_, err = client.Ping(context.Background())
 	errCheck(err)
-  normalLogger.Log("message", fmt.Sprintf("Cache period is set to %v", *cachePeriod))
+	normalLogger.Log("message", fmt.Sprintf("Cache period is set to %v", *cachePeriod))
 
 	prometheus.MustRegister(&dockerHealthCollector{
 		containerClient: client,
